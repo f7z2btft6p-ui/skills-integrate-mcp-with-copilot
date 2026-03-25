@@ -5,14 +5,37 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, EmailStr
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 import os
 from pathlib import Path
+import re
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+# Rate limiter setup
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# HTTPS enforcement middleware
+@app.middleware("http")
+async def enforce_https(request: Request, call_next):
+    # In production, enforce HTTPS
+    # For development, skip
+    if os.getenv("ENVIRONMENT") == "production":
+        if request.headers.get("x-forwarded-proto") != "https":
+            return RedirectResponse(url=f"https://{request.url.netloc}{request.url.path}")
+    response = await call_next(request)
+    return response
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -78,6 +101,14 @@ activities = {
 }
 
 
+# Pydantic models for request validation
+class SignupRequest(BaseModel):
+    email: EmailStr
+
+class UnregisterRequest(BaseModel):
+    email: EmailStr
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -89,8 +120,13 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+@limiter.limit("5/minute")
+def signup_for_activity(request: Request, activity_name: str, signup_data: SignupRequest):
     """Sign up a student for an activity"""
+    # Validate activity name (prevent injection-like issues)
+    if not re.match(r'^[a-zA-Z\s]+$', activity_name):
+        raise HTTPException(status_code=400, detail="Invalid activity name")
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -99,20 +135,25 @@ def signup_for_activity(activity_name: str, email: str):
     activity = activities[activity_name]
 
     # Validate student is not already signed up
-    if email in activity["participants"]:
+    if signup_data.email in activity["participants"]:
         raise HTTPException(
             status_code=400,
             detail="Student is already signed up"
         )
 
     # Add student
-    activity["participants"].append(email)
-    return {"message": f"Signed up {email} for {activity_name}"}
+    activity["participants"].append(signup_data.email)
+    return {"message": f"Signed up {signup_data.email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+@limiter.limit("5/minute")
+def unregister_from_activity(request: Request, activity_name: str, unregister_data: UnregisterRequest):
     """Unregister a student from an activity"""
+    # Validate activity name
+    if not re.match(r'^[a-zA-Z\s]+$', activity_name):
+        raise HTTPException(status_code=400, detail="Invalid activity name")
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -121,12 +162,12 @@ def unregister_from_activity(activity_name: str, email: str):
     activity = activities[activity_name]
 
     # Validate student is signed up
-    if email not in activity["participants"]:
+    if unregister_data.email not in activity["participants"]:
         raise HTTPException(
             status_code=400,
             detail="Student is not signed up for this activity"
         )
 
     # Remove student
-    activity["participants"].remove(email)
-    return {"message": f"Unregistered {email} from {activity_name}"}
+    activity["participants"].remove(unregister_data.email)
+    return {"message": f"Unregistered {unregister_data.email} from {activity_name}"}
